@@ -25,6 +25,7 @@ from math_verify import parse, verify
 from open_r1_video.trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
+import cv2
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
@@ -37,7 +38,8 @@ class GRPOScriptArguments(ScriptArguments):
     """
 
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy",],
+        default_factory=lambda: ["accuracy", "format"],
+        # default_factory=lambda: ["accuracy",],
         metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
     )
     max_pixels: Optional[int] = field(
@@ -167,25 +169,48 @@ def main(script_args, training_args, model_args):
         }
     
     def make_conversation_video(example):
+        # 简化视频时长获取
+        video_path = example["video"]
+        video_duration = 1.0  # 默认值
+        
+        try:
+            # 使用更高效的方式获取视频时长
+            if hasattr(example, "video_duration") and example["video_duration"] > 0:
+                # 如果数据集已经包含时长信息，直接使用
+                video_duration = example["video_duration"]
+            else:
+                # 轻量级的读取方式
+                cap = cv2.VideoCapture(video_path)
+                if cap.isOpened():
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    if fps > 0:
+                        video_duration = frame_count / fps
+                cap.release()
+        except Exception as e:
+            print(f"无法获取视频时长，使用默认值: {e}")
+        
         return {
             "prompt": [
                 {
                     "role": "user",
                     "content": [
                         {"type": "video"},
-                        # {"type": "video", "video": example["video"]},
-                        # {"type": "video", "bytes": open(example["video"],"rb").read()},
                         {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
                     ],
                 },
             ],
-    }
+            "video": example["video"],
+            "video_duration": video_duration,
+        }
 
     if "image" in dataset[script_args.dataset_train_split].features:
         dataset = dataset.map(make_conversation_image)  # Utilize multiprocessing for faster mapping
     elif "video" in dataset[script_args.dataset_train_split].features:
         dataset = dataset.map(
             make_conversation_video,
+            num_proc=4,  # 使用4个进程并行处理
+            desc="处理视频数据"
         )
     else:
         dataset = dataset.map(make_conversation)

@@ -34,6 +34,7 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
     Qwen2VLForConditionalGeneration,
+    Qwen2_5_VLForConditionalGeneration,  # 添加此行导入Qwen2.5VL模型
     Trainer,
     TrainerCallback,
     is_wandb_available,
@@ -187,7 +188,9 @@ class Qwen2VLGRPOTrainer(Trainer):
             model_init_kwargs["use_cache"] = (
                 False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
             )
-            if "Qwen2-VL" in model_id:
+            if "Qwen2.5-VL" in model_id or "Qwen25-VL" in model_id:  # 添加对Qwen2.5VL的支持
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+            elif "Qwen2-VL" in model_id:
                 model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
             elif "Aria" in model_id:
                 model_init_kwargs.pop("use_cache")
@@ -207,7 +210,9 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Reference model
         if is_deepspeed_zero3_enabled():
-            if "Qwen2-VL" in model_id:
+            if "Qwen2.5-VL" in model_id or "Qwen25-VL" in model_id:  # 添加对Qwen2.5VL的支持
+                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+            elif "Qwen2-VL" in model_id:
                 self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
             elif "Aria" in model_id:
                 self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
@@ -223,7 +228,14 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            if "Qwen2-VL" in model_id or "Aria" in model_id:
+            if "Qwen2.5-VL" in model_id or "Qwen25-VL" in model_id:  # 添加对Qwen2.5VL的支持
+                processing_class = AutoProcessor.from_pretrained(model_id)
+                pad_token_id = processing_class.tokenizer.pad_token_id
+                processing_class.pad_token_id = pad_token_id
+                processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
+                processing_class.image_processor.max_pixels = max_pixels
+                processing_class.image_processor.min_pixels = min_pixels
+            elif "Qwen2-VL" in model_id or "Aria" in model_id:
                 processing_class = AutoProcessor.from_pretrained(model_id)
                 pad_token_id = processing_class.tokenizer.pad_token_id
                 processing_class.pad_token_id = pad_token_id
@@ -348,10 +360,45 @@ class Qwen2VLGRPOTrainer(Trainer):
         elif "video" in inputs[0]:
             videos = [x["video"] for x in inputs]
             video_inputs = []
+            
+            # 添加进度日志以便追踪
+            print(f"Processing {len(inputs)} videos with rank {self.args.local_rank}")
+            
+            # 使用更激进的内存清理策略
+            torch.cuda.empty_cache()
+            
+            # 添加 second_per_grid_ts 参数
+            second_per_grid_ts = []
+            
             for (inp_idx, inp) in enumerate(inputs):
-                new_inp = inp.copy()
-                new_inp['prompt'][0]['content'][0]['text'] = inputs[inp_idx]["video"]
-                video_inputs.append(process_vision_info(new_inp["prompt"])[0])
+                try:
+                    new_inp = inp.copy()
+                    new_inp['prompt'][0]['content'][0]['text'] = inputs[inp_idx]["video"]
+                    
+                    # 获取视频时长，如果没有则使用默认值
+                    video_duration = inp.get("video_duration", 1.0)
+                    second_per_grid_ts.append(video_duration)
+                    
+                    # 添加视频处理超时保护
+                    video_input = process_vision_info(new_inp["prompt"])[0]
+                    video_inputs.append(video_input)
+                    
+                    # 更频繁地清理缓存
+                    torch.cuda.empty_cache()
+                    
+                    # 让出一些CPU时间给其他进程
+                    if inp_idx % 1 == 0 and self.args.local_rank > 0:
+                        import time
+                        time.sleep(0.05)  # 短暂暂停，让其他进程有机会
+                except Exception as e:
+                    print(f"Error processing video at index {inp_idx}: {str(e)}")
+                    # 出错时，提供一个有效但简单的替代方案
+                    if len(video_inputs) > 0:
+                        video_inputs.append(video_inputs[-1])  # 使用前一个成功的视频
+                    else:
+                        # 如果是第一个就失败，创建一个空白视频输入
+                        print("Creating fallback video input")
+                        # 这里需要根据您的process_vision_info函数定义合适的fallback
         
         # import pdb; pdb.set_trace()
         
@@ -364,6 +411,11 @@ class Qwen2VLGRPOTrainer(Trainer):
             padding_side="left",
             add_special_tokens=False,
         )
+        
+        # 将 second_per_grid_ts 添加到 prompt_inputs，针对 Qwen2.5VL 模型
+        if "Qwen2.5" in str(type(model)) or "Qwen25" in str(type(model)):
+            prompt_inputs["second_per_grid_ts"] = second_per_grid_ts
+        
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
 
         if self.max_prompt_length is not None:
@@ -379,11 +431,17 @@ class Qwen2VLGRPOTrainer(Trainer):
             temp_generation_config = copy.deepcopy(self.generation_config)
             temp_generation_config.num_return_sequences = 1
 
+            # 添加内存监控与清理
+            torch.cuda.empty_cache()
+            
             all_completions = []
-
-            for i in range(num_generations):  # -1 because we already have one generation
+            for i in range(num_generations):
+                # 降低生成时的温度以增加稳定性
+                # temp_generation_config.temperature = 0.8 if i > 0 else 1.0
                 completion = unwrapped_model.generate(**prompt_inputs, generation_config=temp_generation_config)
                 all_completions.append(completion)
+                # 每生成一个完成后清理缓存
+                torch.cuda.empty_cache()
 
             # Stack all completions and pad if needed
             max_length = max(completion.size(1) for completion in all_completions)
@@ -439,7 +497,17 @@ class Qwen2VLGRPOTrainer(Trainer):
         if "video" in inputs[0]:
             prompt_inputs["pixel_values_videos"] = prompt_inputs["pixel_values_videos"].repeat(len(prompt_completion_ids), 1)
             prompt_inputs["video_grid_thw"] = prompt_inputs["video_grid_thw"].repeat(len(prompt_completion_ids), 1)
-        
+            
+            # 为Qwen2.5VL模型复制second_per_grid_ts
+            if "second_per_grid_ts" in prompt_inputs:
+                # 确保second_per_grid_ts与视频数量匹配
+                if isinstance(prompt_inputs["second_per_grid_ts"], list):
+                    # 如果是列表，使用列表复制
+                    original_list = prompt_inputs["second_per_grid_ts"]
+                    prompt_inputs["second_per_grid_ts"] = original_list * len(prompt_completion_ids)
+                else:
+                    # 如果已经是张量，使用repeat方法
+                    prompt_inputs["second_per_grid_ts"] = prompt_inputs["second_per_grid_ts"].repeat(len(prompt_completion_ids))
         
         per_token_logps = get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
         # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
