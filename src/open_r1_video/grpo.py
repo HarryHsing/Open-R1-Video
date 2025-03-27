@@ -54,6 +54,10 @@ class GRPOScriptArguments(ScriptArguments):
         default=None,
         metadata={"help": "json file path"},
     )
+    reward_weights: list[float] = field(
+        default_factory=lambda: [10.0, 1.0],  # accuracy权重10.0，format权重1.0
+        metadata={"help": "Weights for reward functions"},
+    )
 
 
 def accuracy_reward(completions, solution, **kwargs):
@@ -209,7 +213,7 @@ def main(script_args, training_args, model_args):
     elif "video" in dataset[script_args.dataset_train_split].features:
         dataset = dataset.map(
             make_conversation_video,
-            num_proc=4,  # 使用4个进程并行处理
+            num_proc=16,  # 使用4个进程并行处理
             desc="处理视频数据"
         )
     else:
