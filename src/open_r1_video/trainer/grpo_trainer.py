@@ -571,16 +571,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         # Sum the rewards from all reward functions
-        # rewards = rewards_per_func.sum(dim=1)
-
-        # 在compute_loss函数中
-        # 应用权重到各个奖励函数
-        weighted_rewards = torch.zeros_like(rewards_per_func)
-        for i in range(len(self.reward_funcs)):
-            weighted_rewards[:, i] = rewards_per_func[:, i] * script_args.reward_weights[i]
-
-        # 计算加权总奖励
-        rewards = weighted_rewards.sum(dim=1)
+        rewards = rewards_per_func.sum(dim=1)
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
